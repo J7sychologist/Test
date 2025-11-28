@@ -1,0 +1,253 @@
+# In[]
+# Importing
+import torch, os, webbrowser
+import torch.optim as optim
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import torch.nn.functional as F
+from datetime import datetime
+from typing import Tuple
+from torch.utils.tensorboard import SummaryWriter
+from tensorboard import program
+
+# Set device globally
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_printoptions(edgeitems=3, linewidth=75)
+torch.manual_seed(123)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(123)
+print(f"Used device: {device}")
+
+weight_dir = "E:\\Other\\python_folder\\neuro\\models\\"
+log_dir = "E:\\Other\\python_folder\\neuro\\runs"
+
+# Create directories if they don't exist
+os.makedirs(weight_dir, exist_ok=True)
+os.makedirs(log_dir, exist_ok=True)
+
+
+# In[]
+# Creating classes
+class DataGenerator:
+    def __init__(self, num_samples: int, batch_size: int, device=device):
+        self.device = device
+        self.num_samples = num_samples
+        self.batch_size = batch_size
+        self.g = 9.81
+        self.input, self.target = self._generate_data()
+        self.train_loader, self.val_loader = self._prepare_dataloaders()
+
+    def _generate_data(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        vel = torch.rand(self.num_samples, device=self.device) * 20
+        phi = torch.rand(self.num_samples, device=self.device) * (torch.pi / 2)
+        L = (vel**2) * torch.sin(2 * phi) / self.g
+
+        input_tensor = torch.stack((vel, phi), dim=1).float().to(self.device)
+        output_tensor = L.unsqueeze(1).float().to(self.device)
+        return input_tensor, output_tensor
+
+    def _prepare_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
+        dataset = TensorDataset(self.input, self.target)
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size)
+        return train_loader, val_loader
+
+
+class ResBlock(nn.Module):
+    def __init__(self, num_neurons: int):
+        super().__init__()
+        self.linear = nn.Linear(num_neurons, num_neurons)
+        self.batch_norm = nn.BatchNorm1d(num_neurons)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.linear.weight, nonlinearity="relu")
+        nn.init.constant_(self.batch_norm.weight, 1)
+        nn.init.zeros_(self.batch_norm.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.linear(x)
+        out = self.batch_norm(out)
+        out = F.relu(out)
+        return out + identity
+
+
+class BallisticResNet(nn.Module):
+    def __init__(self, input_size: int, num_neurons: int = 128, n_blocks: int = 1):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(input_size)
+        self.fc1 = nn.Linear(input_size, num_neurons)
+        self.bn1 = nn.BatchNorm1d(num_neurons)
+
+        self.res_blocks = nn.ModuleList(
+            [ResBlock(num_neurons) for _ in range(n_blocks)]
+        )
+
+        self.fc2 = nn.Linear(num_neurons, num_neurons // 4)
+        self.bn2 = nn.BatchNorm1d(num_neurons // 4)
+        self.fc3 = nn.Linear(num_neurons // 4, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.input_bn(x)
+        out = F.relu(self.bn1(self.fc1(out)))
+
+        for block in self.res_blocks:
+            out = block(out)
+
+        out = F.relu(self.bn2(self.fc2(out)))
+        out = self.fc3(out)
+        return out
+
+
+def training_loop(
+    n_epochs: int,
+    optimizer: optim.Optimizer,
+    model: nn.Module,
+    loss_fn: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    patience_limit: int,
+    scheduler: optim.lr_scheduler.ReduceLROnPlateau,
+    writer: SummaryWriter,
+):
+
+    patience_counter = 0
+    best_val_loss = float("inf")
+
+    for epoch in range(1, n_epochs + 1):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            predictions = model(inputs)
+            loss = loss_fn(predictions, targets)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                predictions = model(inputs)
+                loss = loss_fn(predictions, targets)
+                val_loss += loss.item()
+
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+
+        # Update scheduler
+        scheduler.step(val_loss)
+
+        # Logging metrics
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        writer.add_scalar("Learning_rate", optimizer.param_groups[0]["lr"], epoch)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(weight_dir, "best_model.pth"))
+            patience_counter = 0
+            if best_val_loss < 1:
+                print(f"Epoch: {epoch}. Best model! Loss: {val_loss:.5f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience_limit:
+                print("Early stopping triggered")
+                break
+
+        if epoch % 100 == 0:
+            print(
+                f"{datetime.now()}, Epoch {epoch}, "
+                f"Train Loss: {train_loss:.4f}, "
+                f"Val Loss: {val_loss:.4f}, "
+                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+            )
+
+    writer.close()
+
+
+def launch_tensorboard_web(logdir=log_dir, port=6006):
+    tb = program.TensorBoard()
+    tb.configure(argv=[None, "--logdir", logdir, "--port", str(port)])
+    url = tb.launch()
+
+    # Opening in browser
+    if os.name == "nt":  # Windows
+        os.system(f"start {url}")
+    else:
+        webbrowser.open(url)
+
+
+# In[]
+# Initialization
+data_gen = DataGenerator(num_samples=1000, batch_size=32, device=device)
+model = BallisticResNet(input_size=2, num_neurons=512, n_blocks=5).to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=0.5, patience=50
+)
+
+os.makedirs(log_dir, exist_ok=True)
+writer = SummaryWriter(log_dir)
+
+print(f"Parameters: {[p.numel() for p in model.parameters()]}")
+# In[]
+# Training
+try:
+    training_loop(
+        n_epochs=1000,
+        optimizer=optimizer,
+        model=model,
+        loss_fn=nn.MSELoss(),
+        train_loader=data_gen.train_loader,
+        val_loader=data_gen.val_loader,
+        patience_limit=300,
+        scheduler=scheduler,
+        writer=writer,
+    )
+except Exception as e:
+    print(f"Error occurred: {str(e)}")
+    import traceback
+
+    traceback.print_exc()
+
+print("All done")
+# In[]
+# Checking
+try:
+    model.load_state_dict(
+        torch.load(os.path.join(weight_dir, "best_model.pth"), map_location=device)
+    )
+    model.eval()
+    print("Model successfully loaded")
+except Exception as e:
+    print(f"Error loading the model: {e}")
+    import traceback
+
+    traceback.print_exc()
+
+# New test data
+new_data = DataGenerator(num_samples=1000, batch_size=32, device=device)
+
+# Absolute average mistake (MAE)
+with torch.no_grad():
+    predictions = model(new_data.input)
+    mae = torch.abs(predictions - new_data.target).mean()
+    print(f"Mean Absolute Error: {mae.item():.5f}")
+
+# In[]
+# Launching TensorBoard
+launch_tensorboard_web()
