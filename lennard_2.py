@@ -1,3 +1,5 @@
+# Описывает движение и взаимодействие молекул в потенциале Леннарда-Джонса
+
 import matplotlib.pyplot as plt
 from random import randint
 from math import pi, sin, cos
@@ -122,3 +124,4 @@ end_time = time.time()  # время окончания выполнения
 execution_time = end_time - start_time  # вычисляем время выполнения
 
 print(f"Время выполнения программы: {execution_time} секунд")
+
