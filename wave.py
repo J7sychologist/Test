@@ -1,3 +1,5 @@
+# интерфейс-приложение, волны, физика, matplotlib
+
 from typing import Tuple
 
 import numpy as np
@@ -297,3 +299,4 @@ if __name__ == "__main__":
 
     updateGraph()
     plt.show()
+
