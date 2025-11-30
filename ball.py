@@ -1,3 +1,5 @@
+# Задача-игра - попади в корзину мячом
+
 """Блок импорта"""
 import matplotlib.pyplot as plt
 import numpy as np
@@ -179,4 +181,5 @@ if __name__ == "__main__":
                 print("\nПопробуйте еще раз!")
     except KeyboardInterrupt:
         print("\nОтключаюсь...")
+
         exit()
